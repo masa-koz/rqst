@@ -130,9 +130,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                     println!(
                         "lost: {}, rtt: {:?}, cwnd: {} bytes, delivery_rate: {:.3} Mbps",
                         stats.lost,
-                        stats.rtt,
-                        stats.cwnd,
-                        stats.delivery_rate as f64 * 8.0 / (1024.0 * 1024.0)
+                        stats.paths[0].rtt,
+                        stats.paths[0].cwnd,
+                        stats.paths[0].delivery_rate as f64 * 8.0 / (1024.0 * 1024.0)
                     );
                 }
                 now = Instant::now();

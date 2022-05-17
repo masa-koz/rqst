@@ -77,9 +77,9 @@ pub async fn transfer(
                         info!(
                             "lost: {}, rtt: {:?}, cwnd: {} bytes, delivery_rate: {:.3} Mbps",
                             stats.lost,
-                            stats.rtt,
-                            stats.cwnd,
-                            stats.delivery_rate as f64 * 8.0 / (1024.0 * 1024.0)
+                            stats.paths[0].rtt,
+                            stats.paths[0].cwnd,
+                            stats.paths[0].delivery_rate as f64 * 8.0 / (1024.0 * 1024.0)
                         );
                     }
                     if let Ok((front_len, queue_byte_size, queue_len)) = quic2.recv_dgram_info().await {
