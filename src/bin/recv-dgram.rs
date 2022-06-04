@@ -79,7 +79,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         quiche::MAX_CONN_ID_LEN,
         true,
         shutdown_complete_tx.clone(),
-    );
+    ).await;
     loop {
         tokio::select! {
             Ok(conn) = quic.accept() => {

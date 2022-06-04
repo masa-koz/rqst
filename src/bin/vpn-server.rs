@@ -286,7 +286,7 @@ async fn tokio_main(
         quiche::MAX_CONN_ID_LEN,
         !disable_verify,
         shutdown_complete_tx.clone(),
-    );
+    ).await;
     loop {
         tokio::select! {
             Ok(conn) = quic.accept() => {

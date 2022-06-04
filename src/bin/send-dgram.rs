@@ -20,6 +20,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
 
+    /*
     config
         .load_verify_locations_from_file("src/ca.crt")
         .unwrap();
@@ -31,6 +32,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     config
         .load_priv_key_from_pem_file("src/client.key")
         .unwrap();
+    */
 
     config.set_application_protos(b"\x03vpn").unwrap();
 
@@ -90,7 +92,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         quiche::MAX_CONN_ID_LEN,
         false,
         shutdown_complete_tx.clone(),
-    );
+    ).await;
 
     let mut notify_shutdown_rx: broadcast::Receiver<()> = notify_shutdown.subscribe();
     let shutdown_complete_tx1 = shutdown_complete_tx.clone();

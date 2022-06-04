@@ -118,7 +118,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         quiche::MAX_CONN_ID_LEN,
         false,
         shutdown_complete_tx.clone(),
-    );
+    ).await;
 
     let mut notify_shutdown_rx = notify_shutdown.subscribe();
     let notify_shutdown_rx1 = notify_shutdown.subscribe();

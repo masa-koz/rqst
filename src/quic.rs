@@ -1,4 +1,5 @@
 use bytes::{Bytes, BytesMut};
+use if_watch::IfWatcher;
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::time::Duration;
@@ -15,6 +16,7 @@ struct QuicActor {
     receiver: mpsc::Receiver<ActorMessage>,
     udp: UdpSocket,
     udp6: UdpSocket,
+    ifwatcher: IfWatcher,
     config: quiche::Config,
     keylog: Option<File>,
     conn_id_len: usize,
@@ -96,7 +98,7 @@ struct SendDgramRequest {
 }
 
 impl QuicActor {
-    fn new(
+    async fn new(
         receiver: mpsc::Receiver<ActorMessage>,
         udp: UdpSocket,
         udp6: UdpSocket,
@@ -106,10 +108,12 @@ impl QuicActor {
         client_cert_required: bool,
         shutdown_complete: mpsc::Sender<()>,
     ) -> Self {
+        let ifwatcher = IfWatcher::new().await.unwrap();
         QuicActor {
             receiver,
             udp,
             udp6,
+            ifwatcher,
             config,
             keylog,
             conn_id_len,
@@ -464,7 +468,10 @@ impl QuicActor {
                             }
                         }
                     }
-                }
+                },
+                event = Pin::new(&mut self.ifwatcher) => {
+                    info!("Got event {:?}", event);
+                },
                 _ = tokio::time::sleep(timeout.unwrap_or(Duration::from_millis(0))), if timeout.is_some() => {
                     info!("timeout");
                     self.conns.values_mut().for_each(|c| c.quiche_conn.on_timeout());
@@ -548,7 +555,7 @@ pub struct QuicHandle {
 }
 
 impl QuicHandle {
-    pub fn new(
+    pub async fn new(
         udp: UdpSocket,
         udp6: UdpSocket,
         config: quiche::Config,
@@ -567,7 +574,7 @@ impl QuicHandle {
             conn_id_len,
             client_cert_required,
             shutdown_complete,
-        );
+        ).await;
         tokio::spawn(async move { actor.run().await });
 
         Self { sender }
@@ -753,7 +760,7 @@ pub mod testing {
             quiche::MAX_CONN_ID_LEN,
             false,
             shutdown_complete_tx.clone(),
-        );
+        ).await;
         Ok(quic)
     }
 
@@ -784,7 +791,7 @@ pub mod testing {
             quiche::MAX_CONN_ID_LEN,
             false,
             shutdown_complete_tx.clone(),
-        );
+        ).await;
         Ok(quic)
     }
 }
