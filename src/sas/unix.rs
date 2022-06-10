@@ -8,7 +8,7 @@ use std::mem;
 use std::net::SocketAddr;
 use std::os::unix::io::AsRawFd;
 use std::ptr;
-use tokio::net::{lookup_host, ToSocketAddrs, UdpSocket};
+use tokio::net::{ToSocketAddrs, UdpSocket};
 
 pub async fn bind_sas<A: ToSocketAddrs>(addr: A) -> io::Result<UdpSocket> {
     let sock = UdpSocket::bind(addr).await?;
@@ -36,7 +36,7 @@ pub async fn bind_sas<A: ToSocketAddrs>(addr: A) -> io::Result<UdpSocket> {
     Ok(sock)
 }
 
-pub async fn recv_sas(
+pub fn try_recv_sas(
     socket: &UdpSocket,
     buf: &mut [u8],
 ) -> io::Result<(usize, Option<SocketAddr>, Option<SocketAddr>)> {
@@ -116,33 +116,14 @@ pub async fn recv_sas(
     })
 }
 
-pub async fn send_sas<R: ToSocketAddrs, L: ToSocketAddrs>(
+pub fn try_send_sas(
     socket: &UdpSocket,
     buf: &[u8],
-    remote: R,
-    local: L,
+    remote: SocketAddr,
+    local: SocketAddr,
 ) -> io::Result<usize> {
-    let mut addrs = lookup_host(remote).await?;
-    let remote = match addrs.next() {
-        Some(remote) => socket2::SockAddr::from(remote),
-        None => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "no addresses to send data to",
-            ));
-        }
-    };
-
-    let mut addrs = lookup_host(local).await?;
-    let local = match addrs.next() {
-        Some(local) => socket2::SockAddr::from(local),
-        None => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "no addresses to send data from",
-            ));
-        }
-    };
+    let remote = socket2::SockAddr::from(remote);
+    let local = socket2::SockAddr::from(local);
 
     let mut control = [0u8; 128];
 
@@ -208,6 +189,7 @@ pub async fn send_sas<R: ToSocketAddrs, L: ToSocketAddrs>(
 
 #[cfg(test)]
 mod tests {
+    use crate::sas::{recv_sas, send_sas};
     use super::*;
 
     #[tokio::test]
@@ -227,9 +209,7 @@ mod tests {
                 IfAddr::V4(addr) => {
                     println!("{:?}", addr.ip);
                     let remote = SocketAddr::new(IpAddr::V4(addr.ip), recv_port);
-                    let _ = sender.writable().await;
                     sender.send_to(send_buf, remote).await.unwrap();
-                    let _ = sender.writable().await;
                     sender.send_to(send_buf, remote).await.unwrap();
 
                     let _ = receiver.readable().await;
@@ -266,12 +246,9 @@ mod tests {
             match iface.addr {
                 IfAddr::V6(addr) => {
                     let remote = SocketAddr::new(IpAddr::V6(addr.ip), recv_port);
-                    let _ = sender.writable().await;
                     sender.send_to(send_buf, remote).await.unwrap();
-                    let _ = sender.writable().await;
                     sender.send_to(send_buf, remote).await.unwrap();
 
-                    let _ = receiver.readable().await;
                     if let Ok((n, from, to)) = recv_sas(&receiver, &mut recv_buf).await {
                         assert_eq!(n, 5);
                         assert_eq!(from, Some(SocketAddr::new(IpAddr::V6(addr.ip), send_port)));
@@ -306,7 +283,6 @@ mod tests {
                 IfAddr::V4(addr) => {
                     println!("{:?}", addr.ip);
                     let local = SocketAddr::new(IpAddr::V4(addr.ip), 0);
-                    let _ = sender.writable().await;
                     let len = send_sas(
                         &sender,
                         send_buf,
@@ -343,7 +319,6 @@ mod tests {
                 IfAddr::V6(addr) => {
                     println!("{:?}", addr.ip);
                     let local = SocketAddr::new(IpAddr::V6(addr.ip), 0);
-                    let _ = sender.writable().await;
                     let len = send_sas(
                         &sender,
                         send_buf,

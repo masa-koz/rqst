@@ -74,7 +74,7 @@ pub async fn bind_sas<A: ToSocketAddrs>(addr: A) -> io::Result<UdpSocket> {
     Ok(sock)
 }
 
-pub async fn recv_sas(
+pub fn try_recv_sas(
     socket: &UdpSocket,
     buf: &mut [u8],
 ) -> io::Result<(usize, Option<SocketAddr>, Option<SocketAddr>)> {
@@ -179,11 +179,11 @@ pub async fn recv_sas(
     })
 }
 
-pub async fn send_sas<R: ToSocketAddrs, L: ToSocketAddrs>(
+pub async fn try_send_sas(
     socket: &UdpSocket,
     buf: &[u8],
-    remote: R,
-    local: L,
+    remote: SocketAddr,
+    local: SocketAddr,
 ) -> io::Result<usize> {
     let wsasendmsg = if let Some(extension) = *WSASENDMSG {
         extension
@@ -193,27 +193,8 @@ pub async fn send_sas<R: ToSocketAddrs, L: ToSocketAddrs>(
             "WSASendMsg extension not foud",
         ));
     };
-    let mut addrs = lookup_host(remote).await?;
-    let remote = match addrs.next() {
-        Some(remote) => socket2::SockAddr::from(remote),
-        None => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "no addresses to send data to",
-            ));
-        }
-    };
-
-    let mut addrs = lookup_host(local).await?;
-    let local = match addrs.next() {
-        Some(local) => socket2::SockAddr::from(local),
-        None => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "no addresses to send data from",
-            ));
-        }
-    };
+    let remote = socket2::SockAddr::from(remote);
+    let local = socket2::SockAddr::from(local);
 
     let mut control_buffer = [0; 128];
 
@@ -477,6 +458,7 @@ pub fn locate_wsasendmsg(socket: RawSocket) -> io::Result<WSASendMsg> {
 
 #[cfg(test)]
 mod tests {
+    use crate::sas::{recv_sas, send_sas};
     use super::*;
 
     #[tokio::test]
@@ -486,19 +468,15 @@ mod tests {
         let send_buf = b"hello";
         let mut recv_buf = vec![0u8; 1500];
 
-        let _ = sender.writable().await;
         sender.send_to(send_buf, "127.0.0.1:3456").await.unwrap();
-        let _ = sender.writable().await;
         sender.send_to(send_buf, "127.0.0.2:3456").await.unwrap();
 
-        let _ = receiver.readable().await;
         if let Ok((n, from, to)) = recv_sas(&receiver, &mut recv_buf).await {
             assert_eq!(n, 5);
             assert_eq!(from, Some("127.0.0.1:4567".parse().unwrap()));
             assert_eq!(to, Some("127.0.0.1:0".parse().unwrap()));
         }
 
-        let _ = receiver.readable().await;
         if let Ok((n, from, to)) = recv_sas(&receiver, &mut recv_buf).await {
             assert_eq!(n, 5);
             assert_eq!(from, Some("127.0.0.1:4567".parse().unwrap()));
@@ -513,10 +491,8 @@ mod tests {
         let send_buf = b"hello";
         let mut recv_buf = vec![0u8; 1500];
 
-        let _ = sender.writable().await;
         sender.send_to(send_buf, "[::1]:3456").await.unwrap();
 
-        let _ = receiver.readable().await;
         if let Ok((n, from, to)) = recv_sas(&receiver, &mut recv_buf).await {
             assert_eq!(n, 5);
             assert_eq!(from, Some("[::1]:4567".parse().unwrap()));
@@ -539,7 +515,6 @@ mod tests {
             match ipnet.addr() {
                 IpAddr::V4(addr) => {
                     let local = SocketAddr::new(IpAddr::V4(addr), 0);
-                    let _ = sender.writable().await;
                     match send_sas(&sender, send_buf, "192.0.2.1:3456", local).await {
                         Ok(n) => {
                             eprintln!("Succeed in sending from {}", local);
@@ -571,7 +546,6 @@ mod tests {
                 IpAddr::V4(_) => {}
                 IpAddr::V6(addr) => {
                     let local = SocketAddr::new(IpAddr::V6(addr), 0);
-                    let _ = sender.writable().await;
                     match send_sas(&sender, send_buf, "[2001:0db8:0a0b:12f0::1]:3456", local).await {
                         Ok(n) => {
                             eprintln!("Succeed in sending from {}", local);
