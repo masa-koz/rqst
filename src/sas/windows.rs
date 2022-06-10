@@ -4,7 +4,7 @@ use std::mem;
 use std::net::SocketAddr;
 use std::os::windows::io::{AsRawSocket, RawSocket};
 use std::ptr;
-use tokio::net::{lookup_host, ToSocketAddrs, UdpSocket};
+use tokio::net::{ToSocketAddrs, UdpSocket};
 use windows_sys::core::GUID;
 use windows_sys::Win32::Networking::WinSock::{
     closesocket, setsockopt, socket, WSAIoctl, AF_INET, AF_INET6, IN6_PKTINFO, INVALID_SOCKET,
@@ -179,7 +179,7 @@ pub fn try_recv_sas(
     })
 }
 
-pub async fn try_send_sas(
+pub fn try_send_sas(
     socket: &UdpSocket,
     buf: &[u8],
     remote: SocketAddr,

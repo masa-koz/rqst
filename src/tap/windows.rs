@@ -46,7 +46,7 @@ impl Tap {
                     .read(true)
                     .write(true)
                     .create(false)
-                    .attributes(FILE_ATTRIBUTE_SYSTEM.0 | FILE_FLAG_OVERLAPPED.0)
+                    .attributes(FILE_ATTRIBUTE_SYSTEM | FILE_FLAG_OVERLAPPED)
                     .open(format!("\\\\.\\Global\\{}.tap", instance_id))
                 {
                     Ok(file) => Some(file),
