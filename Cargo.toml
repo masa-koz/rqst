@@ -18,9 +18,11 @@ log = { version = "0.4", features = ["std"] }
 env_logger = "0.6.1"
 flexi_logger = "0.22"
 socket2 = "0.4"
+if-addrs = "0.7"
 if-watch = "0.3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 tokio-tun = "0.5.3"
 
 [target.'cfg(windows)'.dependencies]
