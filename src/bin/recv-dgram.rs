@@ -9,16 +9,13 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
-    config
-        .load_verify_locations_from_file("src/ca.crt")
-        .unwrap();
-    config.verify_peer(true);
+    config.verify_peer(false);
 
     config
-        .load_cert_chain_from_pem_file("src/server.crt")
+        .load_cert_chain_from_pem_file("src/cert.crt")
         .unwrap();
     config
-        .load_priv_key_from_pem_file("src/server.key")
+        .load_priv_key_from_pem_file("src/cert.key")
         .unwrap();
 
     config.set_application_protos(&[b"test"]).unwrap();
