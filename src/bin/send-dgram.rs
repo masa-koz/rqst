@@ -80,7 +80,8 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         quiche::MAX_CONN_ID_LEN,
         false,
         shutdown_complete_tx.clone(),
-    ).await;
+    )
+    .await;
 
     let mut notify_shutdown_rx: broadcast::Receiver<()> = notify_shutdown.subscribe();
     let shutdown_complete_tx1 = shutdown_complete_tx.clone();
@@ -93,10 +94,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             ret = quic.connect(url) => {
                 match ret {
                     Ok(conn) => {
-                        println!(
-                            "Connection established: {:?}",
-                            quiche::ConnectionId::from_vec(conn.conn_id.clone())
-                        );
+                        println!("Connection established: {}", conn.conn_handle);
                         conn
                    },
                    Err(e) => {
