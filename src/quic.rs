@@ -150,7 +150,7 @@ impl QuicActor {
                 // Create a QUIC connection and initiate handshake.
                 let mut conn = quiche::connect(
                     url.domain(),
-                    scid.clone().into_owned(),
+                    &scid.clone(),
                     from,
                     to,
                     &mut self.config,
@@ -348,7 +348,7 @@ impl QuicActor {
             let new_dcid = quiche::ConnectionId::from_vec(new_dcid.into());
 
             let mut conn = quiche::accept(
-                new_dcid.clone().into_owned(),
+                &new_dcid.clone(),
                 None,
                 to,
                 from,
@@ -736,7 +736,7 @@ pub mod testing {
         let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
         config.load_cert_chain_from_pem_file("src/cert.crt")?;
         config.load_priv_key_from_pem_file("src/cert.key")?;
-        config.set_application_protos(b"\x06proto1")?;
+        config.set_application_protos(&[b"proto1"])?;
         config.set_max_idle_timeout(10000);
         config.set_max_recv_udp_payload_size(1350);
         config.set_max_send_udp_payload_size(1350);
@@ -766,7 +766,7 @@ pub mod testing {
 
     pub async fn open_client(shutdown_complete_tx: mpsc::Sender<()>) -> Result<QuicHandle> {
         let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
-        config.set_application_protos(b"\x06proto1")?;
+        config.set_application_protos(&[b"proto1"])?;
         config.verify_peer(false);
         config.set_max_idle_timeout(10000);
         config.set_max_recv_udp_payload_size(1350);
