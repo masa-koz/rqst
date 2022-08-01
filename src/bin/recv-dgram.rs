@@ -62,6 +62,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let socket = socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::DGRAM, None)?;
     let address: std::net::SocketAddr = "[::]:4567".parse().unwrap();
     let address = address.into();
+    socket.set_only_v6(true).unwrap();
     socket.bind(&address)?;
     socket.set_recv_buffer_size(0x7fffffff).unwrap();
     socket.set_nonblocking(true).unwrap();
@@ -74,7 +75,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         config,
         keylog,
         quiche::MAX_CONN_ID_LEN,
-        true,
+        false,
         shutdown_complete_tx.clone(),
     ).await;
     loop {
