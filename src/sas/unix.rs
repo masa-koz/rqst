@@ -8,13 +8,32 @@ use std::mem;
 use std::net::SocketAddr;
 use std::os::unix::io::AsRawFd;
 use std::ptr;
-use tokio::net::{ToSocketAddrs, UdpSocket};
+use tokio::net::{ToSocketAddrs, UdpSocket, lookup_host};
 
 pub async fn bind_sas<A: ToSocketAddrs>(addr: A) -> io::Result<UdpSocket> {
-    let sock = UdpSocket::bind(addr).await?;
-    let local_addr = sock.local_addr()?;
+    let mut addrs = lookup_host(addr).await?;
+    let local = match addrs.next() {
+        Some(local) => local,
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "no addresses to bind",
+            ));
+        }
+    };
+    let socket = if local.is_ipv4() {
+        socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?
+    } else {
+        let socket = socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::DGRAM, None)?;
+        socket.set_only_v6(true).unwrap();
+        socket
+    };
 
-    let (level, optname) = if local_addr.is_ipv4() {
+    let address = local.into();
+    socket.bind(&address)?;
+    socket.set_nonblocking(true).unwrap();
+
+    let (level, optname) = if local.is_ipv4() {
         (IPPROTO_IP as i32, IP_PKTINFO as i32)
     } else {
         (IPPROTO_IPV6 as i32, IPV6_RECVPKTINFO as i32)
@@ -22,7 +41,7 @@ pub async fn bind_sas<A: ToSocketAddrs>(addr: A) -> io::Result<UdpSocket> {
     let optval = [1u32; 1];
     let res = unsafe {
         setsockopt(
-            sock.as_raw_fd() as _,
+            socket.as_raw_fd() as _,
             level as _,
             optname as _,
             optval.as_ptr() as _,
@@ -33,7 +52,8 @@ pub async fn bind_sas<A: ToSocketAddrs>(addr: A) -> io::Result<UdpSocket> {
         return Err(io::Error::last_os_error());
     }
 
-    Ok(sock)
+    let socket: std::net::UdpSocket = socket.into();
+    Ok(tokio::net::UdpSocket::from_std(socket).unwrap())
 }
 
 pub fn try_recv_sas(

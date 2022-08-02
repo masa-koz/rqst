@@ -9,6 +9,8 @@ use tokio::sync::{mpsc, oneshot};
 use ring::rand::*;
 use std::net::{SocketAddr, ToSocketAddrs};
 
+use crate::sas::try_recv_sas;
+
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -17,7 +19,9 @@ type ConnectionHandle = u64;
 struct QuicActor {
     receiver: mpsc::Receiver<ActorMessage>,
     udp: UdpSocket,
+    udp_port: u16,
     udp6: UdpSocket,
+    udp6_port: u16,
     ifwatcher: IfWatcher,
     config: quiche::Config,
     keylog: Option<File>,
@@ -77,6 +81,7 @@ enum ActorMessage {
 
 struct QuicConnection {
     quiche_conn: quiche::Connection,
+    conn_handle: ConnectionHandle,
     before_established: bool,
     connect_request: Option<ConnectRequest>,
     recv_dgram_readness_requests: VecDeque<RecvDgramReadnessRequest>,
@@ -114,10 +119,14 @@ impl QuicActor {
         shutdown_complete: mpsc::Sender<()>,
     ) -> Self {
         let ifwatcher = IfWatcher::new().await.unwrap();
+        let udp_addr = udp.local_addr().unwrap();
+        let udp6_addr = udp6.local_addr().unwrap();
         QuicActor {
             receiver,
             udp,
             udp6,
+            udp_port: udp_addr.port(),
+            udp6_port: udp6_addr.port(),
             ifwatcher,
             config,
             keylog,
@@ -177,17 +186,19 @@ impl QuicActor {
                     .await
                     .unwrap();
 
+                let new_conn_handle = self.next_conn_handle;
                 self.conns.insert(
-                    self.next_conn_handle,
+                    new_conn_handle,
                     QuicConnection {
                         quiche_conn: conn,
+                        conn_handle: new_conn_handle,
                         before_established: true,
                         connect_request: Some(ConnectRequest { respond_to }),
                         recv_dgram_readness_requests: VecDeque::new(),
                         send_dgram_requests: VecDeque::new(),
                     },
                 );
-                self.conn_ids.insert(scid, self.next_conn_handle);
+                self.conn_ids.insert(scid, new_conn_handle);
                 self.next_conn_handle += 1;
             }
             ActorMessage::RecvDgramReadness {
@@ -323,14 +334,18 @@ impl QuicActor {
         }
     }
 
-    async fn handle_udp_dgram(&mut self, len: usize, from: SocketAddr) {
+    async fn handle_udp_dgram(&mut self, len: usize, from: SocketAddr, to: Option<SocketAddr>) {
         trace!("Recv UDP {} bytes", len);
         let udp = if from.is_ipv4() {
             &self.udp
         } else {
             &self.udp6
         };
-        let to = udp.local_addr().unwrap();
+        let to = if to.is_some() {
+            to.unwrap()
+        } else {
+            udp.local_addr().unwrap()
+        };
         let hdr = match quiche::Header::from_slice(&mut self.buf, quiche::MAX_CONN_ID_LEN) {
             Ok(v) => v,
             Err(e) => {
@@ -370,13 +385,14 @@ impl QuicActor {
                 new_conn_handle,
                 QuicConnection {
                     quiche_conn: conn,
+                    conn_handle: new_conn_handle,
                     before_established: true,
                     connect_request: None,
                     recv_dgram_readness_requests: VecDeque::new(),
                     send_dgram_requests: VecDeque::new(),
                 },
             );
-            self.conn_ids.insert(new_dcid.clone(), new_conn_handle);
+            self.conn_ids.insert(new_dcid, new_conn_handle);
             self.next_conn_handle += 1;
             
             new_conn_handle
@@ -421,6 +437,11 @@ impl QuicActor {
                 }
             }
 
+            while let Some(retired_scid) = conn.quiche_conn.retired_scid_next() {
+                info!("Retiring source CID: {:?}", retired_scid);
+                self.conn_ids.remove(&retired_scid);
+            }
+
             while conn.quiche_conn.source_cids_left() > 0 {
                 let mut scid = [0; quiche::MAX_CONN_ID_LEN];
                 let scid = &mut scid[0..self.conn_id_len];
@@ -434,7 +455,9 @@ impl QuicActor {
                 if conn.quiche_conn.new_source_cid(&scid, reset_token, false).is_err() {
                     break;
                 }
+                self.conn_ids.insert(scid, conn.conn_handle);
             }
+
             while let Some(event) = conn.quiche_conn.path_event_next() {
                 info!("PathEvent: {:?}", event);
             }
@@ -452,9 +475,17 @@ impl QuicActor {
             tokio::select! {
                 Ok(_) = self.udp.readable() => {
                     loop {
-                        match self.udp.try_recv_from(&mut self.buf[..]) {
-                            Ok((len, from)) => {
-                                self.handle_udp_dgram(len, from).await;
+                        match try_recv_sas(&self.udp, &mut self.buf[..]) {
+                            Ok((len, from, to)) => {
+                                let to = if to.is_some() {
+                                    let mut to = to.unwrap();
+                                    to.set_port(self.udp_port);
+                                    Some(to)
+                                } else {
+                                    None
+                                };
+                                info!("from: {:?}, to: {:?}", from, to);
+                                self.handle_udp_dgram(len, from.unwrap(), to).await;
                             },
                             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                                 break;
@@ -467,9 +498,16 @@ impl QuicActor {
                 },
                 Ok(_) = self.udp6.readable() => {
                     loop {
-                        match self.udp6.try_recv_from(&mut self.buf[..]) {
-                            Ok((len, from)) => {
-                                self.handle_udp_dgram(len, from).await;
+                        match try_recv_sas(&self.udp6, &mut self.buf[..]) {
+                            Ok((len, from, to)) => {
+                                let to = if to.is_some() {
+                                    let mut to = to.unwrap();
+                                    to.set_port(self.udp6_port);
+                                    Some(to)
+                                } else {
+                                    None
+                                };
+                                self.handle_udp_dgram(len, from.unwrap(), to).await;
                             },
                             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                                 break;
@@ -554,7 +592,11 @@ impl QuicActor {
                     info!("event: {:?}", event);
                 }
             }
+
             self.conns.retain(|_, ref mut c| !c.quiche_conn.is_closed());
+
+            self.conn_ids.retain(|_, conn_handle| self.conns.contains_key(conn_handle));
+
             if self.shutdown && self.conns.is_empty() {
                 info!("No connection exists.");
                 break;
