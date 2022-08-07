@@ -2,6 +2,7 @@ extern crate env_logger;
 
 use bytes::BytesMut;
 use rqst::quic::*;
+use rqst::sas::bind_sas;
 use std::env;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
@@ -54,21 +55,16 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let (notify_shutdown, _) = broadcast::channel(1);
     let (shutdown_complete_tx, mut shutdown_complete_rx) = mpsc::channel(1);
 
-    let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?;
-    let address: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
-    let address = address.into();
-    socket.bind(&address)?;
+
+    let udp = bind_sas("0.0.0.0:0").await?;
+    let socket: socket2::Socket = udp.into_std().unwrap().into();
     socket.set_recv_buffer_size(0x7fffffff).unwrap();
-    socket.set_nonblocking(true).unwrap();
     let udp: std::net::UdpSocket = socket.into();
     let udp = tokio::net::UdpSocket::from_std(udp).unwrap();
 
-    let socket = socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::DGRAM, None)?;
-    let address: std::net::SocketAddr = "[::]:0".parse().unwrap();
-    let address = address.into();
-    socket.bind(&address)?;
+    let udp6 = bind_sas("[::]:0").await?;
+    let socket: socket2::Socket = udp6.into_std().unwrap().into();
     socket.set_recv_buffer_size(0x7fffffff).unwrap();
-    socket.set_nonblocking(true).unwrap();
     let udp6: std::net::UdpSocket = socket.into();
     let udp6 = tokio::net::UdpSocket::from_std(udp6).unwrap();
 
