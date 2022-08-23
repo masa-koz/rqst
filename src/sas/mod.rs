@@ -8,8 +8,23 @@ pub mod windows;
 pub use self::windows::*;
 
 use std::io;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, IpAddr, Ipv4Addr, Ipv6Addr};
 use tokio::net::{lookup_host, UdpSocket, ToSocketAddrs};
+
+pub async fn select_local_addr(remote: SocketAddr, local: Option<SocketAddr>) -> io::Result<SocketAddr> {
+    let local = if local.is_some() {
+        local.unwrap()
+    } else {
+        if remote.is_ipv4() {
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+        } else {
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+        }
+    };
+    let socket = UdpSocket::bind(local).await?;
+    socket.connect(remote).await?;
+    socket.local_addr()
+}
 
 pub async fn recv_sas(
     socket: &UdpSocket,

@@ -20,6 +20,8 @@ flexi_logger = "0.22"
 socket2 = "0.4"
 if-addrs = "0.7"
 if-watch = "0.3"
+async-stream = "0.3.3"
+tokio-stream = "0.1.9"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

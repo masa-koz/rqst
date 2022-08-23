@@ -1,9 +1,9 @@
 extern crate env_logger;
 
 use rqst::quic::*;
-use rqst::sas::bind_sas;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
+use std::net::{SocketAddr, IpAddr, Ipv4Addr, Ipv6Addr};
 
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -49,21 +49,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let (notify_shutdown, _) = broadcast::channel(1);
     let (shutdown_complete_tx, mut shutdown_complete_rx) = mpsc::channel(1);
 
-    let udp = bind_sas("0.0.0.0:4567").await?;
-    let socket: socket2::Socket = udp.into_std().unwrap().into();
-    socket.set_recv_buffer_size(0x7fffffff).unwrap();
-    let udp: std::net::UdpSocket = socket.into();
-    let udp = tokio::net::UdpSocket::from_std(udp).unwrap();
-
-    let udp6 = bind_sas("[::]:4567").await?;
-    let socket: socket2::Socket = udp6.into_std().unwrap().into();
-    socket.set_recv_buffer_size(0x7fffffff).unwrap();
-    let udp6: std::net::UdpSocket = socket.into();
-    let udp6 = tokio::net::UdpSocket::from_std(udp6).unwrap();
-
     let quic = QuicHandle::new(
-        udp,
-        udp6,
         config,
         keylog,
         quiche::MAX_CONN_ID_LEN,
@@ -71,6 +57,12 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         shutdown_complete_tx.clone(),
     )
     .await;
+
+    let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 4567);
+    quic.listen(local).await.unwrap();
+    let local = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 4567);
+    quic.listen(local).await.unwrap();
+
     loop {
         tokio::select! {
             Ok(conn) = quic.accept() => {
