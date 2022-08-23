@@ -86,6 +86,24 @@ enum ActorMessage {
         conn_handle: ConnectionHandle,
         respond_to: oneshot::Sender<Result<()>>,
     },
+    ProbePath {
+        conn_handle: ConnectionHandle,
+        local_addr: IpAddr,
+        peer_addr: SocketAddr,
+        respond_to: oneshot::Sender<Result<u64>>,
+    },
+    Migrate {
+        conn_handle: ConnectionHandle,
+        local_addr: IpAddr,
+        peer_addr: SocketAddr,
+        respond_to: oneshot::Sender<Result<u64>>,
+    },
+    PathValidated {
+        conn_handle: ConnectionHandle,
+        local_addr: IpAddr,
+        peer_addr: SocketAddr,
+        respond_to: oneshot::Sender<Result<bool>>,   
+    }
 }
 
 struct QuicConnection {
@@ -400,6 +418,72 @@ impl QuicActor {
                         respond_to.send(Err(format!("No Connection: {:?}", conn_handle).into()));
                 }
             }
+            ActorMessage::ProbePath {
+                conn_handle,
+                local_addr,
+                peer_addr,
+                respond_to,
+            } => {
+                if let Some(conn) = self.conns.get_mut(&conn_handle) {
+                    let socket_addr = conn.socket.local_addr().unwrap();
+                    let local_addr = SocketAddr::new(local_addr, socket_addr.port());
+                    match conn.quiche_conn.probe_path(local_addr, peer_addr) {
+                        Ok(v) => {
+                            let _ = respond_to.send(Ok(v));
+                        }
+                        Err(e) => {
+                            let _ = respond_to.send(Err(format!("probe_path failed: {:?}", e).into()));
+                        }
+                    }
+                } else {
+                    let _ =
+                        respond_to.send(Err(format!("No Connection: {:?}", conn_handle).into()));
+                }
+            }
+            ActorMessage::Migrate {
+                conn_handle,
+                local_addr,
+                peer_addr,
+                respond_to,
+            } => {
+                if let Some(conn) = self.conns.get_mut(&conn_handle) {
+                    let socket_addr = conn.socket.local_addr().unwrap();
+                    let local_addr = SocketAddr::new(local_addr, socket_addr.port());
+                    match conn.quiche_conn.migrate(local_addr, peer_addr) {
+                        Ok(v) => {
+                            let _ = respond_to.send(Ok(v));
+                        }
+                        Err(e) => {
+                            let _ = respond_to.send(Err(format!("migrate_source failed: {:?}", e).into()));
+                        }
+                    }
+                } else {
+                    let _ =
+                        respond_to.send(Err(format!("No Connection: {:?}", conn_handle).into()));
+                }
+            }
+            ActorMessage::PathValidated {
+                conn_handle,
+                local_addr,
+                peer_addr,
+                respond_to,
+            } => {
+                if let Some(conn) = self.conns.get_mut(&conn_handle) {
+                    let socket_addr = conn.socket.local_addr().unwrap();
+                    let local_addr = SocketAddr::new(local_addr, socket_addr.port());
+                    match conn.quiche_conn.is_path_validated(local_addr, peer_addr) {
+                        Ok(v) => {
+                            let _ = respond_to.send(Ok(v));
+                        }
+                        Err(e) => {
+                            let _ = respond_to.send(Err(format!("probe_path failed: {:?}", e).into()));
+                        }
+                    }
+                } else {
+                    let _ =
+                        respond_to.send(Err(format!("No Connection: {:?}", conn_handle).into()));
+                }
+            }
         }
     }
 
@@ -581,7 +665,7 @@ impl QuicActor {
                             trace!("{} written {} bytes", conn.quiche_conn.trace_id(), written);
                         }
                         Err(e) => {
-                            error!("{} send_to() failed: {:?}", conn.quiche_conn.trace_id(), e);
+                            error!("{} send_sas(remote: {}, local: {}) failed: {:?}", conn.quiche_conn.trace_id(), send_info.to, send_info.from, e);
                         }
                     }
                 }
@@ -817,6 +901,42 @@ impl QuicConnectionHandle {
         let (send, recv) = oneshot::channel();
         let msg = ActorMessage::Close {
             conn_handle: self.conn_handle,
+            respond_to: send,
+        };
+        let _ = self.sender.send(msg).await;
+        recv.await.expect("Actor task has been killed")
+    }
+
+    pub async fn probe_path(&self, local_addr: IpAddr, peer_addr: SocketAddr) -> Result<u64> {
+        let (send, recv) = oneshot::channel();
+        let msg = ActorMessage::ProbePath {
+            conn_handle: self.conn_handle,
+            local_addr,
+            peer_addr,
+            respond_to: send,
+        };
+        let _ = self.sender.send(msg).await;
+        recv.await.expect("Actor task has been killed")
+    }
+
+    pub async fn migrate(&self, local_addr: IpAddr, peer_addr: SocketAddr) -> Result<u64> {
+        let (send, recv) = oneshot::channel();
+        let msg = ActorMessage::Migrate {
+            conn_handle: self.conn_handle,
+            local_addr,
+            peer_addr,
+            respond_to: send,
+        };
+        let _ = self.sender.send(msg).await;
+        recv.await.expect("Actor task has been killed")
+    }
+
+    pub async fn is_path_validated(&self, local_addr: IpAddr, peer_addr: SocketAddr) -> Result<bool> {
+        let (send, recv) = oneshot::channel();
+        let msg = ActorMessage::PathValidated {
+            conn_handle: self.conn_handle,
+            local_addr,
+            peer_addr,
             respond_to: send,
         };
         let _ = self.sender.send(msg).await;

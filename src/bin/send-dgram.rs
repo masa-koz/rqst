@@ -1,8 +1,9 @@
 extern crate env_logger;
 
-use if_watch::IfWatcher;
 use bytes::BytesMut;
+use if_watch::{IfEvent, IfWatcher};
 use rqst::quic::*;
+use std::collections::HashSet;
 use std::env;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
@@ -34,9 +35,10 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     config.set_initial_max_stream_data_uni(1_000_000);
     config.set_initial_max_streams_bidi(100);
     config.set_initial_max_streams_uni(100);
-    config.set_disable_active_migration(true);
+    config.set_disable_active_migration(false);
     config.enable_early_data();
     config.enable_dgram(true, 1000, 1000);
+    config.set_active_connection_id_limit(10);
 
     let mut keylog = None;
 
@@ -66,6 +68,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     let mut ifwatcher = IfWatcher::new().await.unwrap();
 
+    let mut local_addrs = HashSet::new();
+    let mut peer_addrs = HashSet::new();
+
     let mut notify_shutdown_rx: broadcast::Receiver<()> = notify_shutdown.subscribe();
     let shutdown_complete_tx1 = shutdown_complete_tx.clone();
 
@@ -92,7 +97,16 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             },
         };
 
-
+        if let Ok(stats) = conn.stats().await {
+            for (idx, path) in stats.paths.iter().enumerate() {
+                println!(
+                    "path[{}]: local_addr: {}, peer_addr: {}, state: {:?}",
+                    idx, path.local_addr, path.peer_addr, path.validation_state
+                );
+                local_addrs.insert(path.local_addr.ip());
+                peer_addrs.insert(path.peer_addr);
+            }
+        }
         println!("enter loop");
         let mut now = Instant::now();
         let mut count: u8 = 0;
@@ -106,6 +120,21 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                         stats.paths[0].cwnd,
                         stats.paths[0].delivery_rate as f64 * 8.0 / (1024.0 * 1024.0)
                     );
+                    for (idx, path) in stats.paths.iter().enumerate() {
+                        println!(
+                            "path[{}]: local_addr: {}, peer_addr: {}, state: {:?}, active: {}",
+                            idx, path.local_addr, path.peer_addr, path.validation_state, path.active,
+                        );
+                        local_addrs.insert(path.local_addr.ip());
+                        peer_addrs.insert(path.peer_addr);
+                        if conn.is_path_validated(path.local_addr.ip(), path.peer_addr).await.unwrap() && !path.active {
+                            println!("MIGRATE local_addr: {}, peer_addr: {}", path.local_addr, path.peer_addr);
+                            match conn.migrate(path.local_addr.ip(), path.peer_addr).await {
+                                Ok(dcid_seq) => println!("dcid_seq: {}", dcid_seq),
+                                Err(e) => println!("migrate failed: {:?}", e),
+                            }
+                        }
+                    }
                 }
                 now = Instant::now();
             }
@@ -133,7 +162,34 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                     }
                 },
                 event = Pin::new(&mut ifwatcher) => {
-                    println!("Got event {:?}", event);
+                    match event {
+                        Ok(IfEvent::Up(v)) => {
+                            if !local_addrs.contains(&v.addr()) {
+                                println!("NEW {:?}", v.addr());
+                                for peer_addr in &peer_addrs {
+                                    if peer_addr.is_ipv4() == v.addr().is_ipv4() {
+                                        println!("PROBE local: {}, peer: {}", v.addr(), peer_addr);
+                                        match conn.probe_path(v.addr(), *peer_addr).await {
+                                            Ok(dcid_seq) => println!("dcid_seq: {}", dcid_seq),
+                                            Err(e) => println!("probe_path failed: {:?}", e),
+                                        }
+                                    }
+                                }
+                            }
+                            if let Ok(stats) = conn.stats().await {
+                                for (idx, path) in stats.paths.iter().enumerate() {
+                                    println!(
+                                        "path[{}]: local_addr: {}, peer_addr: {}, state: {:?}",
+                                        idx, path.local_addr, path.peer_addr, path.validation_state
+                                    );
+                                    local_addrs.insert(path.local_addr.ip());
+                                    peer_addrs.insert(path.peer_addr);
+                                }
+                            }
+                        }
+                        Ok(IfEvent::Down(v)) => println!("Down {:?}", v),
+                        Err(e) => println!("Error: {:?}", e),
+                    }
                 },
                 _ = notify_shutdown_rx.recv() => {
                     break;
