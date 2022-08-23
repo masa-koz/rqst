@@ -1,5 +1,4 @@
 use bytes::{Bytes, BytesMut};
-use if_watch::IfWatcher;
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -13,7 +12,7 @@ use tokio_stream::{Stream, StreamExt, StreamMap};
 use ring::rand::*;
 use std::net::{SocketAddr, ToSocketAddrs};
 
-use crate::sas::{bind_sas, try_recv_sas, select_local_addr};
+use crate::sas::{bind_sas, select_local_addr, send_sas, try_recv_sas};
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;
@@ -28,11 +27,8 @@ struct QuicActor {
     receiver: mpsc::Receiver<ActorMessage>,
     next_socket_handle: SocketHandle,
     sockets: SocketMap,
-    recv_stream: StreamMap<
-        usize,
-        Pin<Box<dyn Stream<Item = (BytesMut, SocketAddr, SocketAddr)> + Send>>,
-    >,
-    ifwatcher: IfWatcher,
+    recv_stream:
+        StreamMap<usize, Pin<Box<dyn Stream<Item = (BytesMut, SocketAddr, SocketAddr)> + Send>>>,
     config: quiche::Config,
     keylog: Option<File>,
     conn_id_len: usize,
@@ -120,7 +116,7 @@ struct SendDgramRequest {
 }
 
 impl QuicActor {
-    async fn new(
+    fn new(
         receiver: mpsc::Receiver<ActorMessage>,
         config: quiche::Config,
         keylog: Option<File>,
@@ -128,13 +124,11 @@ impl QuicActor {
         client_cert_required: bool,
         shutdown_complete: mpsc::Sender<()>,
     ) -> Self {
-        let ifwatcher = IfWatcher::new().await.unwrap();
         QuicActor {
             receiver,
             next_socket_handle: 0,
             sockets: SocketMap::new(),
             recv_stream: StreamMap::new(),
-            ifwatcher,
             config,
             keylog,
             conn_id_len,
@@ -150,10 +144,7 @@ impl QuicActor {
         }
     }
 
-    async fn add_socket(
-        &mut self,
-        local: SocketAddr
-    ) -> std::io::Result<SocketHandle> {
+    async fn add_socket(&mut self, local: SocketAddr) -> std::io::Result<SocketHandle> {
         let socket = bind_sas(&local).await?;
         let socket: socket2::Socket = socket.into_std().unwrap().into();
         socket.set_recv_buffer_size(0x7fffffff).unwrap();
@@ -196,9 +187,7 @@ impl QuicActor {
                 }
             }
         })
-            as Pin<
-                Box<dyn Stream<Item = (BytesMut, SocketAddr, SocketAddr)> + Send>,
-            >;
+            as Pin<Box<dyn Stream<Item = (BytesMut, SocketAddr, SocketAddr)> + Send>>;
         self.recv_stream.insert(socket_handle, stream);
         Ok(socket_handle)
     }
@@ -212,16 +201,14 @@ impl QuicActor {
                     self.accept_requests.push_back(AcceptRequest { respond_to });
                 }
             }
-            ActorMessage::Listen { local, respond_to } => {
-                match self.add_socket(local).await {
-                    Ok(_) => {
-                        let _ = respond_to.send(Ok(()));
-                    }
-                    Err(e) => {
-                        let _ = respond_to.send(Err(format!("add_socket failed: {:?}", e).into()));
-                    }
+            ActorMessage::Listen { local, respond_to } => match self.add_socket(local).await {
+                Ok(_) => {
+                    let _ = respond_to.send(Ok(()));
                 }
-            }
+                Err(e) => {
+                    let _ = respond_to.send(Err(format!("add_socket failed: {:?}", e).into()));
+                }
+            },
             ActorMessage::Connect { url, respond_to } => {
                 let to = url.to_socket_addrs().unwrap().next().unwrap();
                 let from = select_local_addr(to, None).await.unwrap();
@@ -256,8 +243,7 @@ impl QuicActor {
                 let (write, send_info) = conn.send(&mut self.out).expect("initial send failed");
 
                 let socket = self.sockets.get(&socket_handle).unwrap();
-                let _written = socket
-                    .send_to(&self.out[..write], &send_info.to)
+                let _written = send_sas(socket, &self.out[..write], &send_info.to, &send_info.from)
                     .await
                     .unwrap();
 
@@ -571,9 +557,6 @@ impl QuicActor {
                         }
                     }
                 },
-                event = Pin::new(&mut self.ifwatcher) => {
-                    info!("Got event {:?}", event);
-                },
                 _ = tokio::time::sleep(timeout.unwrap_or(Duration::from_millis(0))), if timeout.is_some() => {
                     info!("timeout");
                     self.conns.values_mut().for_each(|c| c.quiche_conn.on_timeout());
@@ -593,7 +576,7 @@ impl QuicActor {
                             break;
                         }
                     };
-                    match conn.socket.send_to(&self.out[..write], &send_info.to).await {
+                    match send_sas(&conn.socket, &self.out[..write], &send_info.to, &send_info.from).await {
                         Ok(written) => {
                             trace!("{} written {} bytes", conn.quiche_conn.trace_id(), written);
                         }
@@ -675,8 +658,7 @@ impl QuicHandle {
             conn_id_len,
             client_cert_required,
             shutdown_complete,
-        )
-        .await;
+        );
 
         tokio::spawn(async move { actor.run().await });
 
@@ -685,7 +667,10 @@ impl QuicHandle {
 
     pub async fn listen(&self, local: SocketAddr) -> Result<()> {
         let (send, recv) = oneshot::channel();
-        let msg = ActorMessage::Listen { local, respond_to: send };
+        let msg = ActorMessage::Listen {
+            local,
+            respond_to: send,
+        };
         let _ = self.sender.send(msg).await;
         match recv.await.expect("Actor task has been killed") {
             Ok(v) => Ok(v),
