@@ -107,6 +107,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 peer_addrs.insert(path.peer_addr);
             }
         }
+        tokio::time::sleep(Duration::from_secs(1)).await; // XXX
         println!("enter loop");
         let mut now = Instant::now();
         let mut count: u8 = 0;
