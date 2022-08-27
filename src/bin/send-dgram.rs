@@ -143,11 +143,8 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             buf.resize(1292, count);
             let buf = buf.freeze();
             tokio::select! {
-                /*
-                _ = sleep(Duration::from_nanos(0)) => {
-                    let res = quic.send_dgram(conn_id.clone(), &buf).await;
-                */
-                res = conn.send_dgram(&buf) => {
+                _ = tokio::time::sleep(Duration::from_millis(1000)) => {
+                    let res = conn.send_dgram(&buf).await;
                     match res {
                         Ok(_) => {
                             if let Some(new_count) = count.checked_add(1) {
