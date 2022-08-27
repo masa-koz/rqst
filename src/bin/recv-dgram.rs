@@ -32,6 +32,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     config.enable_early_data();
     config.enable_dgram(true, 1000, 1000);
     config.set_active_connection_id_limit(10);
+    config.set_enable_multipath(true);
 
     let mut keylog = None;
 
