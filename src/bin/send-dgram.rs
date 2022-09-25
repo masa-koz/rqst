@@ -39,7 +39,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     config.enable_early_data();
     config.enable_dgram(true, 1000, 1000);
     config.set_active_connection_id_limit(10);
-    config.set_enable_multipath(true);
+    config.set_multipath(true);
 
     let mut keylog = None;
 
@@ -98,11 +98,11 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             },
         };
 
-        if let Ok(stats) = conn.stats().await {
-            for (idx, path) in stats.paths.iter().enumerate() {
+        if let Ok(paths) = conn.path_stats().await {
+            for path in paths {
                 println!(
-                    "path[{}]: local_addr: {}, peer_addr: {}, state: {:?}",
-                    idx, path.local_addr, path.peer_addr, path.validation_state
+                    "local_addr: {}, peer_addr: {}, state: {:?}",
+                    path.local_addr, path.peer_addr, path.validation_state
                 );
                 local_addrs.insert(path.local_addr.ip());
                 peer_addrs.insert(path.peer_addr);
@@ -115,17 +115,14 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         loop {
             if Instant::now().duration_since(now) >= Duration::from_secs(1) {
                 if let Ok(stats) = conn.stats().await {
-                    println!(
-                        "lost: {}, rtt: {:?}, cwnd: {} bytes, delivery_rate: {:.3} Mbps",
-                        stats.lost,
-                        stats.paths[0].rtt,
-                        stats.paths[0].cwnd,
-                        stats.paths[0].delivery_rate as f64 * 8.0 / (1024.0 * 1024.0)
-                    );
-                    for (idx, path) in stats.paths.iter().enumerate() {
+                    println!("lost: {}", stats.lost);
+                }
+                if let Ok(paths) = conn.path_stats().await {
+                    for path in paths {
                         println!(
-                            "path[{}]: local_addr: {}, peer_addr: {}, state: {:?}, active: {}",
-                            idx, path.local_addr, path.peer_addr, path.validation_state, path.active,
+                            "local_addr: {}, peer_addr: {}, state: {:?}, active: {}, rtt: {:?}, cwnd: {} bytes, delivery_rate: {:.3} Mbps",
+                            path.local_addr, path.peer_addr, path.validation_state, path.active,
+                            path.rtt, path.cwnd, path.delivery_rate as f64 * 8.0 / (1024.0 * 1024.0)
                         );
                         local_addrs.insert(path.local_addr.ip());
                         peer_addrs.insert(path.peer_addr);
@@ -175,11 +172,11 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                                     }
                                 }
                             }
-                            if let Ok(stats) = conn.stats().await {
-                                for (idx, path) in stats.paths.iter().enumerate() {
+                            if let Ok(paths) = conn.path_stats().await {
+                                for path in paths {
                                     println!(
-                                        "path[{}]: local_addr: {}, peer_addr: {}, state: {:?}",
-                                        idx, path.local_addr, path.peer_addr, path.validation_state
+                                        "local_addr: {}, peer_addr: {}, state: {:?}",
+                                        path.local_addr, path.peer_addr, path.validation_state
                                     );
                                     local_addrs.insert(path.local_addr.ip());
                                     peer_addrs.insert(path.peer_addr);

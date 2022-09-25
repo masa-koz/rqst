@@ -82,6 +82,10 @@ enum ActorMessage {
         conn_handle: ConnectionHandle,
         respond_to: oneshot::Sender<Result<quiche::Stats>>,
     },
+    PathStats {
+        conn_handle: ConnectionHandle,
+        respond_to: oneshot::Sender<Result<Vec<quiche::PathStats>>>,
+    },
     Close {
         conn_handle: ConnectionHandle,
         respond_to: oneshot::Sender<Result<()>>,
@@ -411,6 +415,18 @@ impl QuicActor {
             } => {
                 if let Some(conn) = self.conns.get_mut(&conn_handle) {
                     let stats = conn.quiche_conn.stats();
+                    let _ = respond_to.send(Ok(stats));
+                } else {
+                    let _ =
+                        respond_to.send(Err(format!("No Connection: {:?}", conn_handle).into()));
+                }
+            }
+            ActorMessage::PathStats {
+                conn_handle,
+                respond_to,
+            } => {
+                if let Some(conn) = self.conns.get_mut(&conn_handle) {
+                    let stats = conn.quiche_conn.path_stats().collect::<Vec<quiche::PathStats>>();
                     let _ = respond_to.send(Ok(stats));
                 } else {
                     let _ =
@@ -911,6 +927,15 @@ impl QuicConnectionHandle {
     pub async fn stats(&self) -> Result<quiche::Stats> {
         let (send, recv) = oneshot::channel();
         let msg = ActorMessage::Stats {
+            conn_handle: self.conn_handle,
+            respond_to: send,
+        };
+        let _ = self.sender.send(msg).await;
+        recv.await.expect("Actor task has been killed")
+    }
+    pub async fn path_stats(&self) -> Result<Vec<quiche::PathStats>> {
+        let (send, recv) = oneshot::channel();
+        let msg = ActorMessage::PathStats {
             conn_handle: self.conn_handle,
             respond_to: send,
         };
