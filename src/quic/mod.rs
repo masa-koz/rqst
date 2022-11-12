@@ -22,7 +22,7 @@ type SocketMap = HashMap<SocketHandle, Arc<UdpSocket>>;
 type ConnectionHandle = u64;
 
 struct QuicActor {
-    receiver: mpsc::Receiver<ActorMessage>,
+    receiver: mpsc::Receiver<(Request, oneshot::Sender<Response>)>,
     next_socket_handle: SocketHandle,
     sockets: SocketMap,
     recv_stream:
@@ -42,52 +42,55 @@ struct QuicActor {
 }
 
 #[derive(Debug)]
-enum ActorMessage {
-    Accept {
-        respond_to: oneshot::Sender<Result<ConnectionHandle>>,
-    },
+enum Request {
+    Accept,
     Listen {
         local: SocketAddr,
-        respond_to: oneshot::Sender<Result<()>>,
     },
     Connect {
         url: url::Url,
-        respond_to: oneshot::Sender<Result<ConnectionHandle>>,
     },
     RecvDgramReadness {
         conn_handle: ConnectionHandle,
-        respond_to: oneshot::Sender<Result<()>>,
     },
     RecvDgram {
         conn_handle: ConnectionHandle,
-        respond_to: oneshot::Sender<Result<Option<Bytes>>>,
     },
     RecvDgramVectored {
         conn_handle: ConnectionHandle,
         max_len: usize,
-        respond_to: oneshot::Sender<Result<Vec<Bytes>>>,
     },
     RecvDgramInfo {
         conn_handle: ConnectionHandle,
-        respond_to: oneshot::Sender<Result<(Option<usize>, usize, usize)>>,
     },
     SendDgram {
         conn_handle: ConnectionHandle,
         buf: Bytes,
-        respond_to: oneshot::Sender<Result<()>>,
     },
     Stats {
         conn_handle: ConnectionHandle,
-        respond_to: oneshot::Sender<Result<quiche::Stats>>,
     },
     Close {
         conn_handle: ConnectionHandle,
-        respond_to: oneshot::Sender<Result<()>>,
     },
     PathStats {
         conn_handle: ConnectionHandle,
-        respond_to: oneshot::Sender<Result<Vec<quiche::PathStats>>>,
     },
+}
+
+#[derive(Debug)]
+enum Response {
+    Accept(Result<ConnectionHandle>),
+    Listen(Result<()>),
+    Connect(Result<ConnectionHandle>),
+    RecvDgramReadness(Result<()>),
+    RecvDgram(Result<Option<Bytes>>),
+    RecvDgramVectored(Result<Vec<Bytes>>),
+    RecvDgramInfo(Result<(Option<usize>, usize, usize)>),
+    SendDgram(Result<()>),
+    Stats(Result<quiche::Stats>),
+    Close(Result<()>),
+    PathStats(Result<Vec<quiche::PathStats>>),
 }
 
 struct QuicConnection {
@@ -102,25 +105,25 @@ type QuicConnectionIdMap = HashMap<quiche::ConnectionId<'static>, ConnectionHand
 type QuicConnectionMap = HashMap<ConnectionHandle, QuicConnection>;
 
 struct AcceptRequest {
-    respond_to: oneshot::Sender<Result<ConnectionHandle>>,
+    respond_to: oneshot::Sender<Response>,
 }
 
 struct ConnectRequest {
-    respond_to: oneshot::Sender<Result<ConnectionHandle>>,
+    respond_to: oneshot::Sender<Response>,
 }
 
 struct RecvDgramReadnessRequest {
-    respond_to: oneshot::Sender<Result<()>>,
+    respond_to: oneshot::Sender<Response>,
 }
 
 struct SendDgramRequest {
     buf: Bytes,
-    respond_to: oneshot::Sender<Result<()>>,
+    respond_to: oneshot::Sender<Response>,
 }
 
 impl QuicActor {
     fn new(
-        receiver: mpsc::Receiver<ActorMessage>,
+        receiver: mpsc::Receiver<(Request, oneshot::Sender<Response>)>,
         config: quiche::Config,
         keylog: Option<File>,
         conn_id_len: usize,
@@ -195,229 +198,338 @@ impl QuicActor {
         Ok(socket_handle)
     }
 
-    async fn handle_message(&mut self, msg: ActorMessage) {
+    async fn handle_message(&mut self, msg: Request, respond_to: oneshot::Sender<Response>) {
         match msg {
-            ActorMessage::Accept { respond_to } => {
-                if let Some(conn_handle) = self.wait_conn_handles.pop_front() {
-                    let _ = respond_to.send(Ok(conn_handle));
-                } else {
-                    self.accept_requests.push_back(AcceptRequest { respond_to });
-                }
-            }
-            ActorMessage::Listen { local, respond_to } => match self.add_socket(local).await {
-                Ok(_) => {
-                    let _ = respond_to.send(Ok(()));
-                }
-                Err(e) => {
-                    let _ = respond_to.send(Err(format!("add_socket failed: {:?}", e).into()));
-                }
-            },
-            ActorMessage::Connect { url, respond_to } => {
-                let to = url.to_socket_addrs().unwrap().next().unwrap();
-                let from = select_local_addr(to, None).await.unwrap();
-                let local = if to.is_ipv4() {
-                    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), from.port())
-                } else {
-                    SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), from.port())
-                };
-                let socket_handle = match self.add_socket(local).await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        let _ = respond_to.send(Err(format!("get_binding failed: {:?}", e).into()));
-                        return;
-                    }
-                };
-                // Generate a random source connection ID for the connection.
-                let mut scid = [0; quiche::MAX_CONN_ID_LEN];
-                let scid = &mut scid[0..self.conn_id_len];
-                ring::rand::SystemRandom::new().fill(&mut scid[..]).unwrap();
-
-                let scid = quiche::ConnectionId::from_ref(&scid).into_owned();
-                // Create a QUIC connection and initiate handshake.
-                let mut conn =
-                    quiche::connect(url.domain(), &scid, from, to, &mut self.config)
-                        .unwrap();
-
-                if let Some(keylog) = &self.keylog {
-                    if let Ok(keylog) = keylog.try_clone() {
-                        conn.set_keylog(Box::new(keylog));
-                    }
-                }
-
-                if let Some(dir) = std::env::var_os("QLOGDIR") {
-                    let writer = make_qlog_writer(&dir, "client", &conn.trace_id());
-        
-                    conn.set_qlog(
-                        std::boxed::Box::new(writer),
-                        "quiche-client qlog".to_string(),
-                        format!("{} id={}", "quiche-client qlog", conn.trace_id()),
-                    );
-                }
-
-                let (write, send_info) = conn.send(&mut self.out).expect("initial send failed");
-
-                let socket = self.sockets.get(&socket_handle).unwrap();
-                let _written = send_sas(socket, &self.out[..write], &send_info.to, &send_info.from)
+            Request::Accept => self.handle_accept_request(respond_to).await,
+            Request::Listen { local } => self.handle_listen_request(local, respond_to).await,
+            Request::Connect { url } => self.handle_connect_request(url, respond_to).await,
+            Request::RecvDgramReadness { conn_handle } => {
+                self.handle_recv_dgram_readness_request(conn_handle, respond_to)
                     .await
-                    .unwrap();
-
-                self.conns.insert(
-                    self.next_conn_handle,
-                    QuicConnection {
-                        quiche_conn: conn,
-                        socket: socket.clone(),
-                        before_established: true,
-                        connect_request: Some(ConnectRequest { respond_to }),
-                        recv_dgram_readness_requests: VecDeque::new(),
-                        send_dgram_requests: VecDeque::new(),
-                    },
-                );
-                self.conn_ids.insert(scid, self.next_conn_handle);
-                self.next_conn_handle += 1;
             }
-            ActorMessage::RecvDgramReadness {
-                conn_handle,
-                respond_to,
-            } => {
-                if let Some(conn) = self.conns.get_mut(&conn_handle) {
-                    if conn.quiche_conn.dgram_recv_queue_len() > 0 {
-                        let _ = respond_to.send(Ok(()));
-                    } else {
-                        conn.recv_dgram_readness_requests
-                            .push_back(RecvDgramReadnessRequest { respond_to });
-                    }
-                } else {
-                    let _ = respond_to.send(Err(format!("No Connection: {:?}", conn_handle).into()));
-                }
+            Request::RecvDgram { conn_handle } => {
+                self.handle_recv_dgram_request(conn_handle, respond_to)
+                    .await
             }
-            ActorMessage::RecvDgram {
-                conn_handle,
-                respond_to,
-            } => {
-                if let Some(conn) = self.conns.get_mut(&conn_handle) {
-                    if conn.quiche_conn.dgram_recv_queue_len() > 0 {
-                        let mut buf = BytesMut::with_capacity(1350);
-                        buf.resize(1350, 0);
-                        match conn.quiche_conn.dgram_recv(&mut buf) {
-                            Ok(len) => {
-                                buf.truncate(len);
-                                let _ = respond_to.send(Ok(Some(buf.freeze())));
-                            }
-                            Err(e) if e == quiche::Error::Done => {
-                                let _ = respond_to.send(Ok(None));
-                            }
-                            Err(e) => {
-                                let _ = respond_to
-                                    .send(Err(format!("dgram_recv failed: {:?}", e).into()));
-                            }
-                        }
-                    } else {
-                        let _ = respond_to.send(Ok(None));
-                    }
-                } else {
-                    let _ = respond_to.send(Err(format!("No Connection: {:?}", conn_handle).into()));
-                }
-            }
-            ActorMessage::RecvDgramVectored {
+            Request::RecvDgramVectored {
                 conn_handle,
                 max_len,
-                respond_to,
             } => {
-                if let Some(conn) = self.conns.get_mut(&conn_handle) {
-                    let mut bufs = Vec::new();
-                    while conn.quiche_conn.dgram_recv_queue_len() > 0 {
-                        if bufs.len() > max_len {
-                            break;
-                        }
-                        let mut buf = BytesMut::with_capacity(1350);
-                        buf.resize(1350, 0);
-                        match conn.quiche_conn.dgram_recv(&mut buf) {
-                            Ok(len) => {
-                                buf.truncate(len);
-                                bufs.push(buf.freeze());
-                            }
-                            Err(_) => {
-                                break;
-                            }
-                        }
-                    }
-                    let _ = respond_to.send(Ok(bufs));
-                } else {
-                    let _ = respond_to.send(Err(format!("No Connection: {:?}", conn_handle).into()));
-                }
+                self.handle_recv_dgram_vectored_request(conn_handle, max_len, respond_to)
+                    .await
             }
-            ActorMessage::RecvDgramInfo {
-                conn_handle,
-                respond_to,
-            } => {
-                if let Some(conn) = self.conns.get_mut(&conn_handle) {
-                    let front_len = conn.quiche_conn.dgram_recv_front_len();
-                    let queue_byte_size = conn.quiche_conn.dgram_recv_queue_byte_size();
-                    let queue_len = conn.quiche_conn.dgram_recv_queue_len();
+            Request::RecvDgramInfo { conn_handle } => {
+                self.handle_recv_dgram_info_request(conn_handle, respond_to)
+                    .await
+            }
+            Request::SendDgram { conn_handle, buf } => {
+                self.handle_send_dgram_request(conn_handle, buf, respond_to)
+                    .await
+            }
+            Request::Stats { conn_handle } => {
+                self.handle_stats_request(conn_handle, respond_to).await
+            }
+            Request::PathStats { conn_handle } => {
+                self.handle_path_stats_request(conn_handle, respond_to)
+                    .await
+            }
+            Request::Close { conn_handle } => {
+                self.handle_close_request(conn_handle, respond_to).await
+            }
+        }
+    }
 
-                    let _ = respond_to.send(Ok((front_len, queue_byte_size, queue_len)));
-                } else {
-                    let _ = respond_to.send(Err(format!("No Connection: {:?}", conn_handle).into()));
-                }
+    async fn handle_accept_request(&mut self, respond_to: oneshot::Sender<Response>) {
+        if let Some(conn_handle) = self.wait_conn_handles.pop_front() {
+            let response = Response::Accept(Ok(conn_handle));
+            let _ = respond_to.send(response);
+        } else {
+            self.accept_requests.push_back(AcceptRequest { respond_to });
+        }
+    }
+
+    async fn handle_listen_request(
+        &mut self,
+        local: SocketAddr,
+        respond_to: oneshot::Sender<Response>,
+    ) {
+        let response = match self.add_socket(local).await {
+            Ok(_) => Response::Listen(Ok(())),
+            Err(e) => Response::Listen(Err(format!("add_socket failed: {:?}", e).into())),
+        };
+        let _ = respond_to.send(response);
+    }
+
+    async fn handle_connect_request(
+        &mut self,
+        url: url::Url,
+        respond_to: oneshot::Sender<Response>,
+    ) {
+        let to = url.to_socket_addrs().unwrap().next().unwrap();
+        let from = select_local_addr(to, None).await.unwrap();
+        let local = if to.is_ipv4() {
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), from.port())
+        } else {
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), from.port())
+        };
+        let socket_handle = match self.add_socket(local).await {
+            Ok(v) => v,
+            Err(e) => {
+                let response = Response::Connect(Err(format!("get_binding failed: {:?}", e).into()));
+                let _ = respond_to.send(response);
+                return;
             }
-            ActorMessage::SendDgram {
-                conn_handle,
-                buf,
-                respond_to,
-            } => {
-                if let Some(conn) = self.conns.get_mut(&conn_handle) {
-                    match conn.quiche_conn.dgram_send(&buf) {
-                        Ok(_) => {
-                            let _ = respond_to.send(Ok(()));
-                        }
-                        Err(e) if e == quiche::Error::Done => {
-                            conn.send_dgram_requests
-                                .push_back(SendDgramRequest { buf, respond_to });
-                        }
-                        Err(e) => {
-                            let _ =
-                                respond_to.send(Err(format!("dgram_send failed: {:?}", e).into()));
-                        }
-                    }
-                } else {
-                    let _ = respond_to.send(Err(format!("No Connection: {:?}", conn_handle).into()));
-                }
+        };
+        // Generate a random source connection ID for the connection.
+        let mut scid = [0; quiche::MAX_CONN_ID_LEN];
+        let scid = &mut scid[0..self.conn_id_len];
+        ring::rand::SystemRandom::new().fill(&mut scid[..]).unwrap();
+
+        let scid = quiche::ConnectionId::from_ref(&scid).into_owned();
+        // Create a QUIC connection and initiate handshake.
+        let mut conn = quiche::connect(url.domain(), &scid, from, to, &mut self.config).unwrap();
+
+        if let Some(keylog) = &self.keylog {
+            if let Ok(keylog) = keylog.try_clone() {
+                conn.set_keylog(Box::new(keylog));
             }
-            ActorMessage::Stats {
-                conn_handle,
-                respond_to,
-            } => {
-                if let Some(conn) = self.conns.get_mut(&conn_handle) {
-                    let stats = conn.quiche_conn.stats();
-                    let _ = respond_to.send(Ok(stats));
-                } else {
-                    let _ = respond_to.send(Err(format!("No Connection: {:?}", conn_handle).into()));
-                }
+        }
+
+        if let Some(dir) = std::env::var_os("QLOGDIR") {
+            let writer = make_qlog_writer(&dir, "client", &conn.trace_id());
+
+            conn.set_qlog(
+                std::boxed::Box::new(writer),
+                "quiche-client qlog".to_string(),
+                format!("{} id={}", "quiche-client qlog", conn.trace_id()),
+            );
+        }
+
+        let (write, send_info) = conn.send(&mut self.out).expect("initial send failed");
+
+        let socket = self.sockets.get(&socket_handle).unwrap();
+        let _written = send_sas(socket, &self.out[..write], &send_info.to, &send_info.from)
+            .await
+            .unwrap();
+
+        self.conns.insert(
+            self.next_conn_handle,
+            QuicConnection {
+                quiche_conn: conn,
+                socket: socket.clone(),
+                before_established: true,
+                connect_request: Some(ConnectRequest { respond_to }),
+                recv_dgram_readness_requests: VecDeque::new(),
+                send_dgram_requests: VecDeque::new(),
+            },
+        );
+        self.conn_ids.insert(scid, self.next_conn_handle);
+        self.next_conn_handle += 1;
+    }
+
+    async fn handle_recv_dgram_readness_request(
+        &mut self,
+        conn_handle: u64,
+        respond_to: oneshot::Sender<Response>,
+    ) {
+        let conn = match self.conns.get_mut(&conn_handle) {
+            Some(conn) => conn,
+            None => {
+                let response = Response::RecvDgramReadness(Err(format!("No Connection: {:?}", conn_handle).into()));
+                let _ = respond_to.send(response);
+                return;
             }
-            ActorMessage::PathStats {
-                conn_handle,
-                respond_to,
-            } => {
-                if let Some(conn) = self.conns.get_mut(&conn_handle) {
-                    let stats = conn.quiche_conn.path_stats().collect::<Vec<quiche::PathStats>>();
-                    let _ = respond_to.send(Ok(stats));
-                } else {
-                    let _ =
-                        respond_to.send(Err(format!("No Connection: {:?}", conn_handle).into()));
-                }
+        };
+
+        if conn.quiche_conn.dgram_recv_queue_len() > 0 {
+            let response = Response::RecvDgramReadness(Ok(()));
+            let _ = respond_to.send(response);
+        } else {
+            conn.recv_dgram_readness_requests
+                .push_back(RecvDgramReadnessRequest { respond_to });
+        }
+    }
+
+    async fn handle_recv_dgram_request(
+        &mut self,
+        conn_handle: u64,
+        respond_to: oneshot::Sender<Response>,
+    ) {
+        let conn = match self.conns.get_mut(&conn_handle) {
+            Some(conn) => conn,
+            None => {
+                let response = Response::RecvDgram(Err(format!("No Connection: {:?}", conn_handle).into()));
+                let _ = respond_to.send(response);
+                return;
             }
-            ActorMessage::Close {
-                conn_handle,
-                respond_to,
-            } => {
-                if let Some(conn) = self.conns.get_mut(&conn_handle) {
-                    conn.quiche_conn.close(true, 0x00, b"").ok();
-                    let _ = respond_to.send(Ok(()));
-                } else {
-                    let _ = respond_to.send(Err(format!("No Connection: {:?}", conn_handle).into()));
+        };
+
+        if conn.quiche_conn.dgram_recv_queue_len() == 0 {
+            let response = Response::RecvDgram(Ok(None));
+            let _ = respond_to.send(response);
+            return;
+        }
+
+        let mut buf = BytesMut::with_capacity(1350);
+        buf.resize(1350, 0);
+        let response = match conn.quiche_conn.dgram_recv(&mut buf) {
+            Ok(len) => {
+                buf.truncate(len);
+                Response::RecvDgram(Ok(Some(buf.freeze())))
+            }
+            Err(e) if e == quiche::Error::Done => Response::RecvDgram(Ok(None)),
+            Err(e) => Response::RecvDgram(Err(format!("dgram_recv failed: {:?}", e).into()))
+        };
+
+        let _ = respond_to.send(response);
+    }
+
+    async fn handle_recv_dgram_vectored_request(
+        &mut self,
+        conn_handle: u64,
+        max_len: usize,
+        respond_to: oneshot::Sender<Response>,
+    ) {
+        let conn = match self.conns.get_mut(&conn_handle) {
+            Some(conn) => conn,
+            None => {
+                let response = Response::RecvDgramVectored(Err(format!("No Connection: {:?}", conn_handle).into()));
+                let _ = respond_to.send(response);
+                return;
+            }
+        };
+
+        let mut bufs = Vec::new();
+        while conn.quiche_conn.dgram_recv_queue_len() > 0 {
+            if bufs.len() > max_len {
+                break;
+            }
+            let mut buf = BytesMut::with_capacity(1350);
+            buf.resize(1350, 0);
+            match conn.quiche_conn.dgram_recv(&mut buf) {
+                Ok(len) => {
+                    buf.truncate(len);
+                    bufs.push(buf.freeze());
+                }
+                Err(_) => {
+                    break;
                 }
             }
         }
+
+        let response = Response::RecvDgramVectored(Ok(bufs));
+        let _ = respond_to.send(response);
+    }
+
+    async fn handle_recv_dgram_info_request(
+        &mut self,
+        conn_handle: u64,
+        respond_to: oneshot::Sender<Response>,
+    ) {
+        let conn = match self.conns.get_mut(&conn_handle) {
+            Some(conn) => conn,
+            None => {
+                let response = Response::RecvDgramInfo(Err(format!("No Connection: {:?}", conn_handle).into()));
+                let _ = respond_to.send(response);
+                return;
+            }
+        };
+
+        let front_len = conn.quiche_conn.dgram_recv_front_len();
+        let queue_byte_size = conn.quiche_conn.dgram_recv_queue_byte_size();
+        let queue_len = conn.quiche_conn.dgram_recv_queue_len();
+
+        let response = Response::RecvDgramInfo(Ok((front_len, queue_byte_size, queue_len)));
+        let _ = respond_to.send(response);
+    }
+
+    async fn handle_send_dgram_request(
+        &mut self,
+        conn_handle: u64,
+        buf: Bytes,
+        respond_to: oneshot::Sender<Response>,
+    ) {
+        let conn = match self.conns.get_mut(&conn_handle) {
+            Some(conn) => conn,
+            None => {
+                let response = Response::SendDgram(Err(format!("No Connection: {:?}", conn_handle).into()));
+                let _ = respond_to.send(response);
+                return;
+            }
+        };
+
+        let response = match conn.quiche_conn.dgram_send(&buf) {
+            Ok(_) => Response::SendDgram(Ok(())),
+            Err(e) if e == quiche::Error::Done => {
+                conn.send_dgram_requests
+                    .push_back(SendDgramRequest { buf, respond_to });
+                return;
+            }
+            Err(e) => Response::SendDgram(Err(format!("dgram_send failed: {:?}", e).into()))
+        };
+
+        let _ = respond_to.send(response);
+    }
+
+    async fn handle_stats_request(
+        &mut self,
+        conn_handle: u64,
+        respond_to: oneshot::Sender<Response>,
+    ) {
+        let conn = match self.conns.get_mut(&conn_handle) {
+            Some(conn) => conn,
+            None => {
+                let response = Response::Stats(Err(format!("No Connection: {:?}", conn_handle).into()));
+                let _ = respond_to.send(response);
+                return;
+            }
+        };
+
+        let stats = conn.quiche_conn.stats();
+        let response = Response::Stats(Ok(stats));
+        let _ = respond_to.send(response);
+    }
+
+    async fn handle_path_stats_request(
+        &mut self,
+        conn_handle: u64,
+        respond_to: oneshot::Sender<Response>,
+    ) {
+        let conn = match self.conns.get_mut(&conn_handle) {
+            Some(conn) => conn,
+            None => {
+                let response = Response::PathStats(Err(format!("No Connection: {:?}", conn_handle).into()));
+                let _ = respond_to.send(response);
+                return;
+            }
+        };
+
+        let stats = conn
+            .quiche_conn
+            .path_stats()
+            .collect::<Vec<quiche::PathStats>>();
+
+        let response = Response::PathStats(Ok(stats));
+        let _ = respond_to.send(response);
+    }
+
+    async fn handle_close_request(
+        &mut self,
+        conn_handle: u64,
+        respond_to: oneshot::Sender<Response>,
+    ) {
+        let conn = match self.conns.get_mut(&conn_handle) {
+            Some(conn) => conn,
+            None => {
+                let response = Response::Close(Err(format!("No Connection: {:?}", conn_handle).into()));
+                let _ = respond_to.send(response);
+                return;
+            }
+        };
+
+        conn.quiche_conn.close(true, 0x00, b"").ok();
+        let response = Response::Close(Ok(()));
+        let _ = respond_to.send(response);
     }
 
     async fn handle_udp_dgram(
@@ -448,8 +560,7 @@ impl QuicActor {
 
             let new_dcid = quiche::ConnectionId::from_vec(new_dcid.into());
 
-            let mut conn =
-                quiche::accept(&new_dcid, None, to, from, &mut self.config).unwrap();
+            let mut conn = quiche::accept(&new_dcid, None, to, from, &mut self.config).unwrap();
 
             if let Some(keylog) = &mut self.keylog {
                 if let Ok(keylog) = keylog.try_clone() {
@@ -483,7 +594,7 @@ impl QuicActor {
             );
             self.conn_ids.insert(new_dcid.clone(), new_conn_handle);
             self.next_conn_handle += 1;
-            
+
             new_conn_handle
         } else {
             *self.conn_ids.get(&hdr.dcid).unwrap()
@@ -499,8 +610,11 @@ impl QuicActor {
             if conn.quiche_conn.is_established() {
                 if conn.before_established {
                     if let Some(request) = conn.connect_request.take() {
-                        let _ = request.respond_to.send(Ok(conn_handle));
+                        // Client case
+                        let response = Response::Connect(Ok(conn_handle));
+                        let _ = request.respond_to.send(response);
                     } else {
+                        // Server case
                         let res = conn.quiche_conn.peer_cert();
                         if self.client_cert_required && res.is_none() {
                             conn.quiche_conn
@@ -508,7 +622,8 @@ impl QuicActor {
                                 .ok();
                         } else {
                             if let Some(request) = self.accept_requests.pop_front() {
-                                let _ = request.respond_to.send(Ok(conn_handle));
+                                let response = Response::Accept(Ok(conn_handle));
+                                let _ = request.respond_to.send(response);
                             } else {
                                 self.wait_conn_handles.push_back(conn_handle);
                             }
@@ -521,7 +636,8 @@ impl QuicActor {
             if conn.quiche_conn.is_established() {
                 if conn.quiche_conn.dgram_recv_queue_len() > 0 {
                     while let Some(request) = conn.recv_dgram_readness_requests.pop_front() {
-                        let _ = request.respond_to.send(Ok(()));
+                        let response = Response::RecvDgramReadness(Ok(()));
+                        let _ = request.respond_to.send(response);
                     }
                 }
             }
@@ -536,7 +652,11 @@ impl QuicActor {
                 let reset_token = u128::from_be_bytes(reset_token);
 
                 info!("new_source_cid: {:?} {}", &scid, reset_token);
-                if conn.quiche_conn.new_source_cid(&scid, reset_token, false).is_err() {
+                if conn
+                    .quiche_conn
+                    .new_source_cid(&scid, reset_token, false)
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -559,8 +679,8 @@ impl QuicActor {
                     self.handle_udp_dgram(handle, buf, from, to).await;
                 }
                 maybe_msg = self.receiver.recv(), if !self.shutdown => {
-                    if let Some(msg) = maybe_msg {
-                        self.handle_message(msg).await;
+                    if let Some((msg, respond_to)) = maybe_msg {
+                        self.handle_message(msg, respond_to).await;
                     } else {
                         info!("No handle exists!");
                         self.shutdown = true;
@@ -591,7 +711,14 @@ impl QuicActor {
                             break;
                         }
                     };
-                    match send_sas(&conn.socket, &self.out[..write], &send_info.to, &send_info.from).await {
+                    match send_sas(
+                        &conn.socket,
+                        &self.out[..write],
+                        &send_info.to,
+                        &send_info.from,
+                    )
+                    .await
+                    {
                         Ok(written) => {
                             trace!("{} written {} bytes", conn.quiche_conn.trace_id(), written);
                         }
@@ -604,18 +731,16 @@ impl QuicActor {
                     while let Some(request) = conn.send_dgram_requests.pop_front() {
                         match conn.quiche_conn.dgram_send(&request.buf) {
                             Ok(_) => {
-                                let _ = request.respond_to.send(Ok(()));
+                                let response = Response::SendDgram(Ok(()));
+                                let _ = request.respond_to.send(response);
                             }
                             Err(e) if e == quiche::Error::Done => {
                                 conn.send_dgram_requests.push_front(request);
                                 break;
                             }
                             Err(e) => {
-                                let _ = request.respond_to.send(Err(format!(
-                                    "dgram_send failed: {:?}",
-                                    e
-                                )
-                                .into()));
+                                let response = Response::SendDgram(Err(format!("dgram_send failed: {:?}", e).into()));
+                                let _ = request.respond_to.send(response);
                             }
                         }
                     }
@@ -637,20 +762,23 @@ impl QuicActor {
 impl Drop for QuicConnection {
     fn drop(&mut self) {
         if let Some(request) = self.connect_request.take() {
-            let _ = request.respond_to.send(Err("Connection closed".into()));
+            let response = Response::Connect(Err("Connection closed".into()));
+            let _ = request.respond_to.send(response);
         }
         for request in self.recv_dgram_readness_requests.drain(..) {
-            let _ = request.respond_to.send(Err("Connection closed".into()));
+            let response = Response::RecvDgramReadness(Err("Connection closed".into()));
+            let _ = request.respond_to.send(response);
         }
         for request in self.send_dgram_requests.drain(..) {
-            let _ = request.respond_to.send(Err("Connection closed".into()));
+            let response = Response::SendDgram(Err("Connection closed".into()));
+            let _ = request.respond_to.send(response);
         }
     }
 }
 
 #[derive(Clone)]
 pub struct QuicHandle {
-    sender: mpsc::Sender<ActorMessage>,
+    sender: mpsc::Sender<(Request, oneshot::Sender<Response>)>,
 }
 
 impl QuicHandle {
@@ -678,87 +806,90 @@ impl QuicHandle {
 
     pub async fn listen(&self, local: SocketAddr) -> Result<()> {
         let (send, recv) = oneshot::channel();
-        let msg = ActorMessage::Listen {
+        let msg = Request::Listen {
             local,
-            respond_to: send,
         };
-        let _ = self.sender.send(msg).await;
+        let _ = self.sender.send((msg, send)).await;
         match recv.await.expect("Actor task has been killed") {
-            Ok(v) => Ok(v),
-            Err(e) => Err(e),
+            Response::Listen(Ok(v)) => Ok(v),
+            Response::Listen(Err(e)) => Err(e),
+            v => Err(format!("Invalid Response: {:?}", v).into())
         }
     }
 
     pub async fn accept(&self) -> Result<QuicConnectionHandle> {
         let (send, recv) = oneshot::channel();
-        let msg = ActorMessage::Accept { respond_to: send };
-        let _ = self.sender.send(msg).await;
+        let msg = Request::Accept;
+        let _ = self.sender.send((msg, send)).await;
         match recv.await.expect("Actor task has been killed") {
-            Ok(conn_handle) => Ok(QuicConnectionHandle {
+            Response::Accept(Ok(conn_handle)) => Ok(QuicConnectionHandle {
                 sender: self.sender.clone(),
                 conn_handle,
             }),
-            Err(e) => Err(e),
+            Response::Accept(Err(e)) => Err(e),
+            v => Err(format!("Invalid Response: {:?}", v).into())
         }
     }
 
     pub async fn connect(&self, url: url::Url) -> Result<QuicConnectionHandle> {
         let (send, recv) = oneshot::channel();
-        let msg = ActorMessage::Connect {
-            url,
-            respond_to: send,
-        };
-        let _ = self.sender.send(msg).await;
+        let msg = Request::Connect { url };
+        let _ = self.sender.send((msg, send)).await;
         match recv.await.expect("Actor task has been killed") {
-            Ok(conn_handle) => Ok(QuicConnectionHandle {
+            Response::Connect(Ok(conn_handle)) => Ok(QuicConnectionHandle {
                 sender: self.sender.clone(),
                 conn_handle,
             }),
-            Err(e) => Err(e),
+            Response::Connect(Err(e)) => Err(e),
+            v => Err(format!("Invalid Response: {:?}", v).into())
         }
     }
 }
 
 #[derive(Clone)]
 pub struct QuicConnectionHandle {
-    sender: mpsc::Sender<ActorMessage>,
+    sender: mpsc::Sender<(Request, oneshot::Sender<Response>)>,
     pub conn_handle: ConnectionHandle,
 }
 
 impl QuicConnectionHandle {
     pub async fn recv_dgram_ready(&self) -> Result<()> {
         let (send, recv) = oneshot::channel();
-        let msg = ActorMessage::RecvDgramReadness {
-            conn_handle: self.conn_handle,
-            respond_to: send,
+        let msg = Request::RecvDgramReadness {
+            conn_handle: self.conn_handle
         };
-        let _ = self.sender.send(msg).await;
-        recv.await.expect("Actor task has been killed")
+        let _ = self.sender.send((msg, send)).await;
+        match recv.await.expect("Actor task has been killed") {
+            Response::RecvDgramReadness(Ok(v)) => Ok(v),
+            Response::RecvDgramReadness(Err(e)) => Err(e),
+            v => Err(format!("Invalid Response: {:?}", v).into())
+        }
     }
 
     pub async fn recv_dgram(&self) -> Result<Option<Bytes>> {
         loop {
             let (send, recv) = oneshot::channel();
-            let msg = ActorMessage::RecvDgram {
-                conn_handle: self.conn_handle,
-                respond_to: send,
+            let msg = Request::RecvDgram {
+                conn_handle: self.conn_handle
             };
-            let _ = self.sender.send(msg).await;
+            let _ = self.sender.send((msg, send)).await;
             match recv.await.expect("Actor task has been killed") {
-                Ok(Some(buf)) => {
+                Response::RecvDgram(Ok(Some(buf))) => {
                     return Ok(Some(buf));
                 }
-                Ok(None) => {
+                Response::RecvDgram(Ok(None)) => {
                     let (send, recv) = oneshot::channel();
-                    let msg = ActorMessage::RecvDgramReadness {
-                        conn_handle: self.conn_handle,
-                        respond_to: send,
+                    let msg = Request::RecvDgramReadness {
+                        conn_handle: self.conn_handle
                     };
-                    let _ = self.sender.send(msg).await;
+                    let _ = self.sender.send((msg, send)).await;
                     let _ = recv.await.expect("Actor task has been killed");
                 }
-                Err(e) => {
+                Response::RecvDgram(Err(e)) => {
                     return Err(e);
+                }
+                v => {
+                    return Err(format!("Invalid Response: {:?}", v).into());
                 }
             }
         }
@@ -767,27 +898,28 @@ impl QuicConnectionHandle {
     pub async fn recv_dgram_vectored(&self, max_len: usize) -> Result<Vec<Bytes>> {
         loop {
             let (send, recv) = oneshot::channel();
-            let msg = ActorMessage::RecvDgramVectored {
+            let msg = Request::RecvDgramVectored {
                 conn_handle: self.conn_handle,
-                max_len,
-                respond_to: send,
+                max_len
             };
-            let _ = self.sender.send(msg).await;
+            let _ = self.sender.send((msg, send)).await;
             match recv.await.expect("Actor task has been killed") {
-                Ok(bufs) => {
+                Response::RecvDgramVectored(Ok(bufs)) => {
                     if !bufs.is_empty() {
                         return Ok(bufs);
                     }
                     let (send, recv) = oneshot::channel();
-                    let msg = ActorMessage::RecvDgramReadness {
-                        conn_handle: self.conn_handle,
-                        respond_to: send,
+                    let msg = Request::RecvDgramReadness {
+                        conn_handle: self.conn_handle
                     };
-                    let _ = self.sender.send(msg).await;
+                    let _ = self.sender.send((msg, send)).await;
                     let _ = recv.await.expect("Actor task has been killed");
                 }
-                Err(e) => {
+                Response::RecvDgramVectored(Err(e)) => {
                     return Err(e);
+                }
+                v => {
+                    return Err(format!("Invalid Response: {:?}", v).into());
                 }
             }
         }
@@ -795,59 +927,76 @@ impl QuicConnectionHandle {
 
     pub async fn recv_dgram_info(&self) -> Result<(Option<usize>, usize, usize)> {
         let (send, recv) = oneshot::channel();
-        let msg = ActorMessage::RecvDgramInfo {
-            conn_handle: self.conn_handle,
-            respond_to: send,
+        let msg = Request::RecvDgramInfo {
+            conn_handle: self.conn_handle
         };
-        let _ = self.sender.send(msg).await;
-        recv.await.expect("Actor task has been killed")
+        let _ = self.sender.send((msg, send)).await;
+        match recv.await.expect("Actor task has been killed") {
+            Response::RecvDgramInfo(Ok(v)) => Ok(v),
+            Response::RecvDgramInfo(Err(e)) => Err(e),
+            v => Err(format!("Invalid Response: {:?}", v).into())
+        }
     }
 
     pub async fn send_dgram(&self, buf: &Bytes) -> Result<()> {
         let (send, recv) = oneshot::channel();
-        let msg = ActorMessage::SendDgram {
+        let msg = Request::SendDgram {
             conn_handle: self.conn_handle,
-            buf: buf.clone(),
-            respond_to: send,
+            buf: buf.clone()
         };
-        let _ = self.sender.send(msg).await;
-        recv.await.expect("Actor task has been killed")
+        let _ = self.sender.send((msg, send)).await;
+        match recv.await.expect("Actor task has been killed") {
+            Response::SendDgram(Ok(v)) => Ok(v),
+            Response::SendDgram(Err(e)) => Err(e),
+            v => Err(format!("Invalid Response: {:?}", v).into())
+        }
     }
 
     pub async fn stats(&self) -> Result<quiche::Stats> {
         let (send, recv) = oneshot::channel();
-        let msg = ActorMessage::Stats {
-            conn_handle: self.conn_handle,
-            respond_to: send,
+        let msg = Request::Stats {
+            conn_handle: self.conn_handle
         };
-        let _ = self.sender.send(msg).await;
-        recv.await.expect("Actor task has been killed")
+        let _ = self.sender.send((msg, send)).await;
+        match recv.await.expect("Actor task has been killed") {
+            Response::Stats(Ok(v)) => Ok(v),
+            Response::Stats(Err(e)) => Err(e),
+            v => Err(format!("Invalid Response: {:?}", v).into())
+        }
     }
 
     pub async fn path_stats(&self) -> Result<Vec<quiche::PathStats>> {
         let (send, recv) = oneshot::channel();
-        let msg = ActorMessage::PathStats {
-            conn_handle: self.conn_handle,
-            respond_to: send,
+        let msg = Request::PathStats {
+            conn_handle: self.conn_handle            
         };
-        let _ = self.sender.send(msg).await;
-        recv.await.expect("Actor task has been killed")
+        let _ = self.sender.send((msg, send)).await;
+        match recv.await.expect("Actor task has been killed") {
+            Response::PathStats(Ok(v)) => Ok(v),
+            Response::PathStats(Err(e)) => Err(e),
+            v => Err(format!("Invalid Response: {:?}", v).into())
+        }
     }
 
     pub async fn close(&self) -> Result<()> {
         let (send, recv) = oneshot::channel();
-        let msg = ActorMessage::Close {
-            conn_handle: self.conn_handle,
-            respond_to: send,
+        let msg = Request::Close {
+            conn_handle: self.conn_handle
         };
-        let _ = self.sender.send(msg).await;
-        recv.await.expect("Actor task has been killed")
+        let _ = self.sender.send((msg, send)).await;
+        match recv.await.expect("Actor task has been killed") {
+            Response::Close(Ok(v)) => Ok(v),
+            Response::Close(Err(e)) => Err(e),
+            v => Err(format!("Invalid Response: {:?}", v).into())
+        }
     }
 }
 
 /// Makes a buffered writer for a qlog.
 pub fn make_qlog_writer(
-    dir: &std::ffi::OsStr, role: &str, id: &str,
+    dir: &std::ffi::OsStr,
+    role: &str,
+    id: &str,
 ) -> std::io::BufWriter<std::fs::File> {
     let mut path = std::path::PathBuf::from(dir);
     let filename = format!("{}-{}.sqlog", role, id);
