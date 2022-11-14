@@ -74,9 +74,11 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                     println!("enter loop");
                     let mut now = Instant::now();
                     let mut bytes = 0;
+                    let mut buf_read_dgram = conn.open_buf_read_dgram(512).await.unwrap();
                     loop {
                         let elapsed = Instant::now().duration_since(now);
                         if elapsed >= Duration::from_secs(1) {
+                        /*
                             if let Ok((front_len, queue_byte_size, queue_len)) = conn.recv_dgram_info().await {
                                 println!(
                                     "front_len: {} bytes, queue_byte_size: {} bytes, queue_len: {} counts",
@@ -84,12 +86,14 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                                     queue_byte_size,
                                     queue_len
                                 );
-                                now = Instant::now();
                             }
+                        */
                             println!("{:.3} Mbps", bytes as f64 * 8.0 / (1024.0 * 1024.0) / elapsed.as_secs_f64());
                             bytes = 0;
+                            now = Instant::now();
                         }
                         tokio::select! {
+                            /*
                             _ = conn.recv_dgram_ready() => {
                                 let ret = conn.recv_dgram_vectored(1).await;
                                 match ret {
@@ -102,7 +106,19 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                                     }
                                 }
                             },
-                            _ = tokio::time::sleep(Duration::from_secs(0)) => {}
+                            */
+                            res = buf_read_dgram.read_data() => {
+                                match res {
+                                    Ok(buf) => {
+                                        bytes += buf.len();
+                                    }
+                                    Err(e) => {
+                                        println!("recv_dgram: failed: {:?}", e);
+                                        break;
+                                    }
+                                }
+                            }
+                            //_ = tokio::time::sleep(Duration::from_secs(0)) => {}
                             _ = notify_shutdown_rx.recv() => {
                                 println!("leave loop");
                                 break;
